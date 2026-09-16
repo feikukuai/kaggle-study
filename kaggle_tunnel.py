@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+kaggle_tunnel.py — Kaggle 学习项目辅助脚本
+把本机 HTTP 服务暴露为一个临时公网地址,便于在受限沙箱环境中查看结果。
+仅供学习用途;具体通道可用性取决于运行环境。
+
+用法:
+    python kaggle_tunnel.py --port 8188 [--out /path/to/tunnel_url.txt]
+"""
+import argparse
+import html as _html
+import os
+import re
+import shutil
+import signal
+import subprocess
+import threading
+import time
+
+import requests
+
+PATTERNS = [
+    re.compile(r"https://[a-z0-9\-]+\.trycloudflare\.com"),
+    re.compile(r"https://[a-zA-Z0-9\-\.]+\.pinggy\.(?:link|io)"),
+    re.compile(r"https://[a-z0-9\-]+\.loca\.lt"),
+    re.compile(r"https://[a-z0-9\-]+\.serveo\.net"),
+    re.compile(r"https://[a-zA-Z0-9\-]+\.ngrok(?:-free)?\.app"),
+]
+
+
+def ensure_cloudflared():
+    if shutil.which("cloudflared") is not None:
+        return
+    print("[tunnel] installing cloudflared ...")
+    subprocess.run(
+        "wget -q https://modelscope.oss-cn-beijing.aliyuncs.com/resource/cloudflared-linux-amd64.deb -O /tmp/cloudflared.deb",
+        shell=True, check=False)
+    subprocess.run("dpkg -i /tmp/cloudflared.deb", shell=True, check=False)
+    if shutil.which("cloudflared") is None:
+        print("[tunnel] fallback to cloudflare official source ...")
+        subprocess.run(
+            "curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared",
+            shell=True, check=False)
+
+
+def candidates(port: int, ngrok_token: str):
+    out = []
+    cfd = shutil.which("cloudflared")
+    if cfd:
+        out.append(("cloudflared", [cfd, "tunnel", "--url", f"http://127.0.0.1:{port}", "--no-autoupdate"]))
+    if shutil.which("ssh"):
+        out.append(("pinggy", ["ssh", "-p", "443", "-o", "StrictHostKeyChecking=no",
+                               "-o", "UserKnownHostsFile=/dev/null", "-o", "ServerAliveInterval=60", "-N",
+                               "-R0:localhost:%d" % port, "a.pinggy.io"]))
+        out.append(("localhost.run", ["ssh", "-o", "StrictHostKeyChecking=no",
+                                      "-o", "UserKnownHostsFile=/dev/null", "-o", "ServerAliveInterval=60", "-N",
+                                      "-R", "80:localhost:%d" % port, "localhost.run"]))
+        out.append(("serveo.net", ["ssh", "-o", "StrictHostKeyChecking=no",
+                                   "-o", "UserKnownHostsFile=/dev/null", "-o", "ServerAliveInterval=60", "-N",
+                                   "-R", "80:localhost:%d" % port, "serveo.net"]))
+    out.append(("localtunnel", ["npx", "-y", "localtunnel", "--port", str(port)]))
+    ng = shutil.which("ngrok")
+    if ngrok_token.strip() and ng:
+        out.append(("ngrok", [ng, "http", str(port), "--log=stdout",
+                              "--log-format=logfmt", "--authtoken", ngrok_token.strip()]))
+    return out
+
+
+def _watch(name, proc, found):
+    for line in iter(proc.stdout.readline, ""):
+        for pat in PATTERNS:
+            m = pat.search(line)
+            if m and name not in found:
+                found[name] = m.group(0)
+                return
+        if proc.poll() is not None:
+            return
+
+
+def main():
+    ap = argparse.ArgumentParser(description="expose a local http port via a temporary public url")
+    ap.add_argument("--port", type=int, required=True)
+    ap.add_argument("--out", default="", help="write the url to this file when established")
+    args = ap.parse_args()
+    port = args.port
+
+    # 0) make sure the local server is up
+    try:
+        requests.get(f"http://127.0.0.1:{port}/system_stats", timeout=3).raise_for_status()
+    except Exception:
+        raise RuntimeError(f"no service on http://127.0.0.1:{port}")
+
+    ensure_cloudflared()
+
+    ngrok_token = os.environ.get("NGROK_AUTH_TOKEN", "")
+    if ngrok_token.strip() and shutil.which("ngrok") is None:
+        subprocess.run("pip install -q ngrok", shell=True, check=False)
+
+    print(f"[tunnel] exposing http://127.0.0.1:{port} ...")
+    found, procs = {}, []
+    for name, cmd in candidates(port, ngrok_token):
+        try:
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 text=True, bufsize=1, start_new_session=True)
+        except Exception as exc:
+            print(f"[tunnel] channel {name} failed to start: {exc}")
+            continue
+        procs.append((name, p))
+        threading.Thread(target=_watch, args=(name, p, found), daemon=True).start()
+
+    deadline = time.time() + 150
+    winner = None
+    while time.time() < deadline:
+        if found:
+            first_name = next(n for n, _ in procs if n in found)
+            winner = (first_name, found[first_name])
+            break
+        time.sleep(1)
+
+    for name, p in procs:
+        if winner is None or name != winner[0]:
+            try:
+                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+
+    if winner is None:
+        raise RuntimeError("[tunnel] no channel available within 150s; check network or try later")
+
+    provider, url = winner
+    print("[tunnel] provider:", provider)
+    print("[tunnel] public url:", url)
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as f:
+            f.write(url)
+        print("[tunnel] url written to", args.out)
+
+
+if __name__ == "__main__":
+    main()
