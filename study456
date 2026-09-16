@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-kaggle_tunnel.py — Kaggle 学习项目辅助脚本
+study456 — Kaggle 学习项目辅助脚本
 把本机 HTTP 服务暴露为一个临时公网地址,便于在受限沙箱环境中查看结果。
 仅供学习用途;具体通道可用性取决于运行环境。
 
 用法:
-    python kaggle_tunnel.py --port 8188 [--out /path/to/tunnel_url.txt]
+    python study456 --port 8188 [--out /path/to/tunnel_url.txt]
 """
 import argparse
 import html as _html
